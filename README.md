@@ -39,7 +39,7 @@ python3 main.py --config ./configs/homotopy/cifar10.py --mode train --workdir ho
 - method: **VAPO**: `homotopy`
 * dataset: One of `cifar10`, `celeba`
 
-**Important Note** : We use a relatively large batch (`training.batch_size=256` for CIFAR-10, ~19 GB GPU memory usage; `training.batch_size=128` for CelebA 64x64, ~31 GB GPU memory usage) for training. To adjust GPU memory cost, please modify the `training.batch_size` parameter in the config files. 
+**Important Note** : We use the batch size (`training.batch_size=128` for CIFAR-10; `training.batch_size=64` for CelebA 64x64) for training. To adjust GPU memory cost, please modify the `training.batch_size` parameter in the config files. 
 
 
 *  `workdir` is the path that stores all artifacts of one experiment, like checkpoints, samples, and evaluation results.
@@ -61,7 +61,7 @@ python3 main.py --config ./configs/homotopy/cifar10.py --mode train --workdir ho
 
 Please place the pretrained checkpoints under the directory `workdir/checkpoints`, e.g., `homotopy_cifar10/checkpoints`.
 
-To generate and evaluate the FID/IS of  (10k) samples of the VAPO model, you could execute:
+To generate and evaluate the FID/IS of the VAPO model on 10k samples, you could execute:
 
 ```shell
 python3 main.py --config ./configs/homotopy/cifar10.py --mode eval --workdir homotopy_cifar10 --config.eval.enable_sampling --config.eval.num_samples 10000
