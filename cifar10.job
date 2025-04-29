@@ -1,0 +1,53 @@
+#!/bin/bash
+#SBATCH --job-name=GrAPH_cifar10
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=16G
+#SBATCH --time=7-00:00:00
+#SBATCH --output=cifar10-%j.log
+
+##SBATCH --partition=highprio,gpu
+#SBATCH --partition=gpu
+
+##SBATCH --gres=gpu:a100:1
+##SBATCH --gres=gpu:7g.80gb:1
+#SBATCH --gres=gpu:3g.40gb:1
+
+# Load necessary modules
+#module load python/3.10.5
+module load anaconda/2024.02
+module load cuda/cudnn/8.4.1
+eval "$(conda shell.bash hook)"
+
+# Check GPU status
+nvidia-smi
+nvcc --version
+
+# Activate your conda environment
+#conda create -n GrAPH python=3.10
+conda activate GrAPH
+
+# Check installed packages
+conda list
+
+# Check path
+pwd
+
+#pip install --upgrade pip
+#pip install -r requirements.txt
+#pip install torch==1.12.1+cu116 torchvision==0.13.1+cu116 torchaudio==0.12.1 --extra-index-url https://download.pytorch.org/whl/cu116
+#pip install --upgrade "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+#pip install "numpy<2.0" 
+
+
+#python main.py --config ./configs/homotopy/cifar10.py --mode eval --workdir cifar10_Corr_Lap_Norms_mp1_vp1_sc2-v0-l0-n0-t0_wc1-v0-l1-n0.5-t0.1_fmot_cos_d1_ts0_tm1_te1_AdamW_lr1e-4_wd0_a0_b0.9_gc3s_B64_b64_n1_UNET-gelu-time-m0.5-d1-c128-n2-h2 --config.eval.enable_sampling --config.eval.num_samples 5000 --config.eval.batch_size 256 --config.sampling.t_end 1.0 --config.sampling.weight 1.0
+
+#python -m pytorch_fid /home/admin01/Junn/VAPO/cifar10_Corr_Lap_Norms_mp1_vp1_sc2-v0-l0-n0-t0_wc1-v0-l1-n0.5-t0.1_fmot_cos_d1_ts0_tm1_te1_AdamW_lr1e-4_wd0_a0_b0.9_gc3s_B64_b64_n1_UNET-gelu-time-m0.5-d1-c128-n2-h2/save/ckpt_36 /home/admin01/Junn/VAPO/assets/stats/fid_stats_cifar10_train.npz
+
+
+python main.py --config ./configs/homotopy/cifar10_FM_mean_corr_cos_sc1_sl1_wc1_wl1_wn0.5_wt0.1_ts1e-5_Adam_silu.py --mode train --workdir cifar10_FM_mean_corr_cos_sc1_sl1_wc1_wl1_wn0.5_wt0.1_ts1e-5_Adam_silu
+
+#python main.py --config ./configs/homotopy/cifar10_FM_mean_corr_cos_sc1_sl1_wc1_wl1_wn0.5_wt0.1_ts1e-5_Adam_gelu.py --mode train --workdir cifar10_FM_mean_corr_cos_sc1_sl1_wc1_wl1_wn0.5_wt0.1_ts1e-5_Adam_gelu
+
+#python main.py --config ./configs/homotopy/cifar10_FM_mean_corr_cos_sc1_sl1_wc1_wl1_wn0.5_wt0.1_ts1e-5_Adam_gelu_lr3e-5.py --mode train --workdir cifar10_FM_mean_corr_cos_sc1_sl1_wc1_wl1_wn0.5_wt0.1_ts1e-5_Adam_gelu_lr3e-5
