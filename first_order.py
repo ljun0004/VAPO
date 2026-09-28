@@ -12,15 +12,15 @@ parameter gradient using only ordinary first-order backward passes:
     central finite difference [Phi(z + h u) - Phi(z - h u)] / (2h) (error O(h^2)), which only needs
     forward passes of Phi and first-order backward passes.
   * With the detached normaliser of the covariance/correlation term, its gradient is
-    grad_theta sum_i a_i Phi(x_i) with detached weights a_i.  Because Phi_i depends only on x_i
-    (GroupNorm, attention and dropout act per sample), ONE backward pass with cotangent a yields both
-    that parameter gradient and a_i * grad_x Phi(x_i), from which g_i is recovered.
+    grad_theta sum_i a_i Phi(x_i) with detached weights a_i; it is carried by the same two passes via
+    (Phi(z + h u) + Phi(z - h u)) / 2 = Phi(z) + O(h^2).  The first pass only computes grad_(x,t) Phi.
   * The whole surrogate is a weighted sum of per-sample Phi evaluations, so the three forward passes
     are back-propagated one at a time: peak activation memory equals ordinary first-order training.
 
 Requirements / caveats:
   * Dropout masks must be identical in all three passes (handled here by replaying the RNG state).
-  * The network must be per-sample independent (no BatchNorm in train mode).
+  * The network must be per-sample independent (no BatchNorm in train mode), since each sample gets
+    its own finite-difference direction.
   * The finite difference needs full fp32: disable TF32 (torch.backends.cudnn.allow_tf32 = False,
     torch.backends.cuda.matmul.allow_tf32 = False) and do not autocast these passes to fp16/bf16.
     Run check_first_order.py to confirm agreement with double backprop on your hardware/precision.
@@ -66,23 +66,15 @@ def first_order_backward(net_fn, x, cond, extra, zeroth_weights, grad_loss_fn, f
   cond = cond.detach().requires_grad_(True) if cond is not None else None
   rng_pre = _get_rng_state()
 
-  # Pass 1: Phi(x); a single backward with cotangent a gives the zeroth-order parameter gradient AND a_i * g_i.
+  # Pass 1: Phi(x) and its input gradients only (no parameter gradients); the graph is freed here.
   psi = net_fn(inputs(x, cond)).reshape(-1)
   rng_post = _get_rng_state()
-  a = zeroth_weights(psi.detach()).detach()
-  a_max = a.abs().max()
-  tiny = torch.finfo(a.dtype).tiny
-  if a_max > 0:
-    # Floor |a_i| at 1e-6 max|a| so that a_i * g_i stays well above underflow (changes the gradient by <= 1e-6).
-    floor = a_max * 1e-6
-    a = torch.where(a.abs() >= floor, a, torch.where(a >= 0, floor, -floor))
-    torch.autograd.backward(psi, grad_tensors=a)
-    g_x = (x.grad / a[:, None]).detach()
-    g_t = (cond.grad / a[:, None]).detach() if cond is not None else None
-  else:  # no zeroth-order term: plain input gradients
-    grads = torch.autograd.grad(psi, [x] + ([cond] if cond is not None else []), torch.ones_like(psi))
-    g_x, g_t = grads[0].detach(), (grads[1].detach() if cond is not None else None)
+  grads = torch.autograd.grad(psi, [x] + ([cond] if cond is not None else []), torch.ones_like(psi))
+  g_x = grads[0].detach()
+  g_t = grads[1].detach() if cond is not None else None
   psi = psi.detach()
+  a = zeroth_weights(psi).detach()
+  tiny = torch.finfo(psi.dtype).tiny
 
   # Direction U = d(grad loss)/dg on detached leaves (elementwise graph only, no network).
   g_x_leaf = g_x.clone().requires_grad_(True)
@@ -98,6 +90,7 @@ def first_order_backward(net_fn, x, cond, extra, zeroth_weights, grad_loss_fn, f
   weight = u_norm / (2 * fd_step)
 
   # Passes 2-3: central difference, each back-propagated (and freed) on its own, same dropout masks.
+  # The zeroth-order term rides along as (Phi(z+) + Phi(z-)) / 2 = Phi(z) + O(h^2).
   x0 = x.detach()
   c0 = cond.detach() if cond is not None else None
   for sign in (1.0, -1.0):
@@ -105,7 +98,7 @@ def first_order_backward(net_fn, x, cond, extra, zeroth_weights, grad_loss_fn, f
     xs = x0 + sign * fd_step * u_x
     cs = c0 + sign * fd_step * u_t if cond is not None else None
     phi = net_fn(inputs(xs, cs)).reshape(-1)
-    torch.autograd.backward(phi, grad_tensors=sign * weight)
+    torch.autograd.backward(phi, grad_tensors=0.5 * a + sign * weight)
     del phi
   _set_rng_state(rng_post)
   return psi, g_x, g_t, grad_loss.detach()
