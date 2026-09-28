@@ -27,6 +27,7 @@ from methods import VESDE, VPSDE
 from models import utils_poisson
 import datasets
 import lamb
+from first_order import first_order_backward
 import logging
 # from models.ebm_models import get_timestep_embedding
 # from models.ebm_models import GaussianFourierProjection
@@ -135,6 +136,8 @@ def get_perturb_batch_loss_fn(sde, train, reduce_mean=True, continuous=True, eps
             assert batch_size == ensemble_size
           # num_particles = sde.config.training.num_particles
           sample_size = sde.config.training.sample_size
+          # 'double': create_graph double backprop (default); 'first_order': see first_order.py
+          grad_mode = getattr(sde.config.training, 'grad_mode', 'double')
 
           # Get the mini-batch
           batch = batch.reshape(batch_size, -1)
@@ -214,79 +217,6 @@ def get_perturb_batch_loss_fn(sde, train, reduce_mean=True, continuous=True, eps
               # print(samples_x.min(), samples_x.max(), samples_s.min(), samples_s.max())
               samples_x[:sample_size] = samples_s
 
-          with torch.enable_grad():
-            # Get model function
-            net_fn = mutils.get_predict_fn(sde, model, train=train, continuous=continuous)
-
-            # Predict scalar potential
-            samples_x.requires_grad = True
-            # time embeddings
-            if sde.config.training.augment_t:
-              if sde.config.model.temb_type == 'time':
-                cond_samples = t_samples
-              elif sde.config.model.temb_type == 'lamb': 
-                cond_samples = 1 * torch.log((t_clipped) / (1-t_clipped))
-              cond_samples.requires_grad = True
-              if sde.config.training.class_guidance:
-                samples_net = torch.cat([samples_x, cond_samples, std_enc, labels], dim=-1)
-              else:
-                samples_net = torch.cat([samples_x, cond_samples, std_enc], dim=-1)
-            else:
-              samples_net = samples_x
-            psi = net_fn(samples_net).squeeze(dim=-1)
-            Reg = psi.pow(2).mean()
-
-            # Normalize potential by its mean
-            # psi -= psi.mean(dim=0, keepdim=True)
-
-            # Compute (backpropagate) N-dimensional Poisson field (gradient)
-            if sde.config.training.augment_t:
-              drift_x, drift_emb = torch.autograd.grad(psi, [samples_x, cond_samples], torch.ones_like(psi), create_graph=True)
-            else:
-              drift_x = torch.autograd.grad(psi, samples_x, torch.ones_like(psi), create_graph=True)[0]
-            # laplacian_x = torch.autograd.grad(drift_x, samples_x, torch.ones_like(drift_x), create_graph=True)[0]
-
-          # Compute drift norm
-          if sde.config.training.augment_t: 
-            Norm_emb = drift_emb.pow(2) * (1-t_clipped).pow(sde.config.training.std_power_temb)
-            Norm_emb = Norm_emb.sum(dim=-1).mean()
-          if sde.config.training.reduce_mean:
-            Norm_emb = Norm_emb.mean()
-          else:
-            Norm_emb = Norm_emb.sum(dim=-1).mean()
-
-          if sde.config.training.entropic:
-            etp_cond = - gaussians_x * (sde.config.training.coeff_diffusion)**2
-            Norm_etp = (drift_x - etp_cond).pow(2) * (1-t_clipped).pow(sde.config.training.std_power_norm)
-          else:
-            Norm_etp = drift_x.pow(2) * (1-t_clipped).pow(sde.config.training.std_power_norm)
-          if sde.config.training.reduce_mean:
-            Norm_etp = Norm_etp.mean()
-          else:
-            Norm_etp = Norm_etp.sum(dim=-1).mean()
-
-          if sde.config.optim.laplacian_mode == 'score':
-            vf_cond = (std_dt * gaussians_x)
-          elif sde.config.optim.laplacian_mode == 'fmot':
-            vf_cond = (mean_dt * batch) + (std_dt * gaussians_x)
-            
-          if sde.config.optim.cvf_mode == 'dist':
-            Laplacian = (drift_x - vf_cond).pow(2) * (1-t_clipped).pow(sde.config.training.std_power_lap)
-          elif sde.config.optim.cvf_mode == 'dot':
-            Laplacian = - (drift_x * vf_cond) * (1-t_clipped).pow(sde.config.training.std_power_lap)
-          elif sde.config.optim.cvf_mode == 'cos':
-            Laplacian = - (drift_x * vf_cond)
-            Norm_lap = (drift_x.norm(dim=-1) * vf_cond.norm(dim=-1))[:, None] + 1e-8
-            Laplacian = Laplacian / Norm_lap.pow(1 - (1-t_clipped).pow(sde.config.training.std_power_lap))
-            # Laplacian = - F.cosine_similarity(drift_x, vf_cond, dim=-1)[:, None] * (1-t_clipped).pow(sde.config.training.std_power_lap)
-          if sde.config.training.reduce_mean:
-            Laplacian = Laplacian.mean()
-          else:
-            Laplacian = Laplacian.sum(dim=-1).mean()
-          
-          # Vel = - drift_emb * (1-t_clipped).pow(sde.config.training.std_power_vel)
-          # Vel = Vel.mean()
-            
           if sde.config.training.method == 'posterior':  
 
             with torch.no_grad():
@@ -299,21 +229,123 @@ def get_perturb_batch_loss_fn(sde, train, reduce_mean=True, continuous=True, eps
                 Gamma = innovation.sum(dim=-1)
               Gamma = Gamma - Gamma.mean()
 
+          def gradient_terms(drift_x, drift_emb):
+            """Loss terms that depend on the potential gradients (drift_x, drift_emb)."""
+            # Compute drift norm
+            Norm_emb = 0
+            if sde.config.training.augment_t: 
+              Norm_emb = drift_emb.pow(2) * (1-t_clipped).pow(sde.config.training.std_power_temb)
+              Norm_emb = Norm_emb.sum(dim=-1).mean()
+              if sde.config.training.reduce_mean:
+                Norm_emb = Norm_emb.mean()
+              else:
+                Norm_emb = Norm_emb.sum(dim=-1).mean()
+
+            if sde.config.training.entropic:
+              etp_cond = - gaussians_x * (sde.config.training.coeff_diffusion)**2
+              Norm_etp = (drift_x - etp_cond).pow(2) * (1-t_clipped).pow(sde.config.training.std_power_norm)
+            else:
+              Norm_etp = drift_x.pow(2) * (1-t_clipped).pow(sde.config.training.std_power_norm)
+            if sde.config.training.reduce_mean:
+              Norm_etp = Norm_etp.mean()
+            else:
+              Norm_etp = Norm_etp.sum(dim=-1).mean()
+
+            if sde.config.optim.laplacian_mode == 'score':
+              vf_cond = (std_dt * gaussians_x)
+            elif sde.config.optim.laplacian_mode == 'fmot':
+              vf_cond = (mean_dt * batch) + (std_dt * gaussians_x)
+              
+            if sde.config.optim.cvf_mode == 'dist':
+              Laplacian = (drift_x - vf_cond).pow(2) * (1-t_clipped).pow(sde.config.training.std_power_lap)
+            elif sde.config.optim.cvf_mode == 'dot':
+              Laplacian = - (drift_x * vf_cond) * (1-t_clipped).pow(sde.config.training.std_power_lap)
+            elif sde.config.optim.cvf_mode == 'cos':
+              Laplacian = - (drift_x * vf_cond)
+              Norm_lap = (drift_x.norm(dim=-1) * vf_cond.norm(dim=-1))[:, None] + 1e-8
+              Laplacian = Laplacian / Norm_lap.pow(1 - (1-t_clipped).pow(sde.config.training.std_power_lap))
+              # Laplacian = - F.cosine_similarity(drift_x, vf_cond, dim=-1)[:, None] * (1-t_clipped).pow(sde.config.training.std_power_lap)
+            if sde.config.training.reduce_mean:
+              Laplacian = Laplacian.mean()
+            else:
+              Laplacian = Laplacian.sum(dim=-1).mean()
+            
+            # Vel = - drift_emb * (1-t_clipped).pow(sde.config.training.std_power_vel)
+            # Vel = Vel.mean()
+
+            Norm = sde.config.training.weight_norm * Norm_etp
+            if sde.config.training.augment_t:
+              Norm += sde.config.training.weight_temb * Norm_emb
+            return Norm, Laplacian
+
+          def cov_scale(psi_detached):
+            if sde.config.optim.cov_mode == 'cov':
+              return sde.config.training.divisor + eps
+            elif sde.config.optim.cov_mode == 'corr':
+              return Gamma.std() * psi_detached.std() + eps
+
+          with torch.enable_grad():
+            # Get model function
+            net_fn = mutils.get_predict_fn(sde, model, train=train, continuous=continuous)
+
+            # Predict scalar potential
+            samples_x.requires_grad = True
+            # time embeddings
+            cond_samples, extra = None, []
+            if sde.config.training.augment_t:
+              if sde.config.model.temb_type == 'time':
+                cond_samples = t_samples
+              elif sde.config.model.temb_type == 'lamb': 
+                cond_samples = 1 * torch.log((t_clipped) / (1-t_clipped))
+              cond_samples.requires_grad = True
+              if sde.config.training.class_guidance:
+                extra = [std_enc, labels]
+              else:
+                extra = [std_enc]
+              samples_net = torch.cat([samples_x, cond_samples] + extra, dim=-1)
+            else:
+              samples_net = samples_x
+
+            if grad_mode == 'first_order' and train:
+              # Same parameter gradient as the create_graph path below, using only first-order backward
+              # passes (see first_order.py). Gradients are accumulated into .grad here; Loss is detached.
+              def zeroth_weights(psi_detached):
+                # d(weight_cov * Corr)/d psi_i, with the normaliser detached as in the create_graph path
+                return sde.config.training.weight_cov * Gamma / (Gamma.shape[0] * cov_scale(psi_detached))
+
+              def grad_loss_fn(drift_x, drift_emb):
+                Norm, Laplacian = gradient_terms(drift_x, drift_emb)
+                return Norm + sde.config.training.weight_lap * Laplacian
+
+              psi, drift_x, drift_emb, _ = first_order_backward(
+                net_fn, samples_x, cond_samples, extra, zeroth_weights, grad_loss_fn,
+                fd_step=getattr(sde.config.training, 'fd_step', 3e-2))
+            else:
+              psi = net_fn(samples_net).squeeze(dim=-1)
+
+              # Normalize potential by its mean
+              # psi -= psi.mean(dim=0, keepdim=True)
+
+              # Compute (backpropagate) N-dimensional Poisson field (gradient)
+              drift_emb = None
+              if sde.config.training.augment_t:
+                drift_x, drift_emb = torch.autograd.grad(psi, [samples_x, cond_samples], torch.ones_like(psi), create_graph=True)
+              else:
+                drift_x = torch.autograd.grad(psi, samples_x, torch.ones_like(psi), create_graph=True)[0]
+              # laplacian_x = torch.autograd.grad(drift_x, samples_x, torch.ones_like(drift_x), create_graph=True)[0]
+            Reg = psi.pow(2).mean()
+
+          Norm, Laplacian = gradient_terms(drift_x, drift_emb)
+
           # Compute sample correlation between potential and NIS
           Cov = (Gamma * psi).mean()
-          if sde.config.optim.cov_mode == 'cov':
-            Corr = Cov / (sde.config.training.divisor + eps)
-          elif sde.config.optim.cov_mode == 'corr':
-            Corr = Cov / (Gamma.std() * psi.detach().std() + eps)
+          Corr = Cov / cov_scale(psi.detach())
             
           Loss = torch.zeros_like(Corr)
           Loss += sde.config.training.weight_cov * Corr
           
           # Loss += sde.config.training.weight_vel * Vel
 
-          Norm = sde.config.training.weight_norm * Norm_etp
-          if sde.config.training.augment_t:
-            Norm += sde.config.training.weight_temb * Norm_emb
           Loss += Norm
           
           Loss += sde.config.training.weight_lap * Laplacian
@@ -357,10 +389,11 @@ def get_step_fn(sde, train, optimize_fn=None, sampling_fn=None, reduce_mean=Fals
             # Sample bool
             if sde.config.training.sample_freq > 0 and state['step'] % sde.config.training.sample_freq == 0 and state['step'] > sde.config.optim.warmup: 
               sample_bool = True
-            Loss, Corr, Laplacian, Norm, Reg = perturb_loss_fn(model, batch, state, train, labels=labels, sample_bool=sample_bool, ind_bool=ind_bool)
             optimizer = state['optimizer']
             optimizer.zero_grad()
-            Loss.backward()
+            Loss, Corr, Laplacian, Norm, Reg = perturb_loss_fn(model, batch, state, train, labels=labels, sample_bool=sample_bool, ind_bool=ind_bool)
+            if Loss.requires_grad:  # False in grad_mode='first_order' (gradients already accumulated)
+              Loss.backward()
             optimize_fn(optimizer, model.parameters(), step=state['step'])
             state['step'] += 1
             # if state['sigma_max'] > sde.config.training.sigma_clip: 

@@ -20,6 +20,10 @@ def get_default_configs():
   training.continuous = True
   training.reduce_mean = False
   training.M = 291
+  ## 'double': gradient terms via create_graph double backprop; 'first_order': same gradient with
+  ## first-order passes only (see first_order.py). fd_step: finite-difference step of 'first_order'.
+  training.grad_mode = 'double'
+  training.fd_step = 3e-2
 
   # sampling
   config.sampling = sampling = ml_collections.ConfigDict()
