@@ -1,9 +1,18 @@
 """Checks training.grad_mode='first_order' against the default create_graph path on one batch.
 
 Reports the cosine similarity / relative error of the parameter gradients and, on CUDA, the peak memory
-and time per training step of both modes. Uses a random batch in [-1, 1] (no dataset download needed).
+and time per training step of both modes.
 
   python3 check_first_order.py --config ./configs/homotopy/cifar10.py --batch_size 128
+
+The finite-difference error depends on the curvature of the network, so calibrate fd_step on a trained model
+and real data, e.g.
+
+  python3 check_first_order.py --checkpoint homotopy_cifar10/checkpoints/checkpoint_30.pth --ema \
+      --batch_npy batch.npy --fd_step 0.01,0.03,0.1,0.3
+
+where batch.npy holds a [B, C, H, W] array already scaled like the training data ([-1, 1] when
+data.centered). Without --batch_npy a random batch in [-1, 1] is used.
 
 The finite difference in 'first_order' needs full fp32 arithmetic, so it disables TF32 in its own passes
 unless training.fd_allow_tf32 is set (--allow_tf32). The gradient reference ('double') is computed in strict
@@ -26,6 +35,7 @@ except ImportError:
 import losses
 import methods
 from models import utils as mutils
+from models.ema import ExponentialMovingAverage
 import models.unet  # noqa: F401  (registers the 'unet' model)
 
 
@@ -40,7 +50,10 @@ def main():
   parser = argparse.ArgumentParser()
   parser.add_argument('--config', default='./configs/homotopy/cifar10.py')
   parser.add_argument('--batch_size', type=int, default=None)
-  parser.add_argument('--fd_step', type=float, default=None)
+  parser.add_argument('--fd_step', default=None, help='finite-difference step, or a comma-separated list to sweep')
+  parser.add_argument('--checkpoint', default=None, help='checkpoint .pth saved by run_lib.train')
+  parser.add_argument('--ema', action='store_true', help='evaluate the EMA weights of --checkpoint')
+  parser.add_argument('--batch_npy', default=None, help='.npy array [B, C, H, W] of scaled training images')
   parser.add_argument('--iters', type=int, default=3)
   parser.add_argument('--allow_tf32', action='store_true')
   args = parser.parse_args()
@@ -48,16 +61,27 @@ def main():
   config = load_config(args.config)
   if args.batch_size is not None:
     config.training.batch_size = config.training.small_batch_size = args.batch_size
-  if args.fd_step is not None:
-    config.training.fd_step = args.fd_step
+  fd_steps = [float(h) for h in args.fd_step.split(',')] if args.fd_step else [config.training.fd_step]
   config.training.fd_allow_tf32 = args.allow_tf32
   device = config.device
   sde = methods.Homotopy(config)
   torch.manual_seed(0)
   model = mutils.create_model(config)
+  if args.checkpoint:
+    loaded = torch.load(args.checkpoint, map_location=device)
+    model.load_state_dict(loaded['model'], strict=False)
+    if args.ema:
+      ema = ExponentialMovingAverage(model.parameters(), decay=config.model.ema_rate)
+      ema.load_state_dict(loaded['ema'])
+      ema.copy_to(model.parameters())
   loss_fn = losses.get_perturb_batch_loss_fn(sde, train=True, method_name='homotopy')
-  B, C, H = config.training.batch_size, config.data.channels, config.data.image_size
-  batch = (torch.rand(B, C, H, H) * 2 - 1).to(device)
+  if args.batch_npy:
+    import numpy as np
+    batch = torch.from_numpy(np.load(args.batch_npy)).float().to(device)
+    config.training.batch_size = config.training.small_batch_size = batch.shape[0]
+  else:
+    B, C, H = config.training.batch_size, config.data.channels, config.data.image_size
+    batch = (torch.rand(B, C, H, H) * 2 - 1).to(device)
   params = [p for p in model.parameters() if p.requires_grad]
 
   def step(mode, seed):
@@ -70,19 +94,23 @@ def main():
     return float(loss)
 
   default_tf32 = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
-  grads, values = {}, {}
-  for mode in ('double', 'first_order'):
+  print(f"fd_allow_tf32={args.allow_tf32}  default TF32 flags (matmul, cudnn) used for 'double' timing: {default_tf32}")
+
+  def grad_of(mode):
     torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False  # strict fp32 reference
-    values[mode] = step(mode, seed=1234)
-    grads[mode] = torch.cat([p.grad.flatten() for p in params if p.grad is not None])
-  torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = default_tf32
-  ref, new = grads['double'], grads['first_order']
-  cos = torch.nn.functional.cosine_similarity(new, ref, dim=0).item()
-  rel = ((new - ref).norm() / ref.norm()).item()
-  print(f"fd_step={config.training.fd_step:g}  fd_allow_tf32={args.allow_tf32}  "
-        f"default TF32 flags (matmul, cudnn) used for 'double' timing: {default_tf32}")
-  print(f"loss: double={values['double']:.6f}  first_order={values['first_order']:.6f}")
-  print(f"parameter gradient: cosine={cos:.6f}  relative L2 error={rel:.2e}")
+    value = step(mode, seed=1234)
+    torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = default_tf32
+    return value, torch.cat([p.grad.flatten() for p in params if p.grad is not None])
+
+  value_ref, ref = grad_of('double')
+  for h in fd_steps:
+    config.training.fd_step = h
+    value, new = grad_of('first_order')
+    cos = torch.nn.functional.cosine_similarity(new, ref, dim=0).item()
+    rel = ((new - ref).norm() / ref.norm()).item()
+    print(f"fd_step={h:g}: gradient cosine={cos:.6f}  relative L2 error={rel:.2e}  "
+          f"(loss double={value_ref:.6f}, first_order={value:.6f})")
+  config.training.fd_step = fd_steps[0]
 
   for mode in ('double', 'first_order'):
     if device.type == 'cuda':
