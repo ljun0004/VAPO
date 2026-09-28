@@ -319,7 +319,8 @@ def get_perturb_batch_loss_fn(sde, train, reduce_mean=True, continuous=True, eps
 
               psi, drift_x, drift_emb, _ = first_order_backward(
                 net_fn, samples_x, cond_samples, extra, zeroth_weights, grad_loss_fn,
-                fd_step=getattr(sde.config.training, 'fd_step', 3e-2))
+                fd_step=getattr(sde.config.training, 'fd_step', 3e-2),
+                allow_tf32=getattr(sde.config.training, 'fd_allow_tf32', False))
             else:
               psi = net_fn(samples_net).squeeze(dim=-1)
 

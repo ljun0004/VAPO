@@ -5,8 +5,9 @@ and time per training step of both modes. Uses a random batch in [-1, 1] (no dat
 
   python3 check_first_order.py --config ./configs/homotopy/cifar10.py --batch_size 128
 
-The finite difference in 'first_order' needs full fp32 arithmetic; TF32 is disabled below. Run once with
---allow_tf32 to see the effect on your hardware before enabling TF32 for 'first_order' training.
+The finite difference in 'first_order' needs full fp32 arithmetic, so it disables TF32 in its own passes
+unless training.fd_allow_tf32 is set (--allow_tf32). The gradient reference ('double') is computed in strict
+fp32; the timings of 'double' use PyTorch's default TF32 flags, i.e. what training uses today.
 """
 
 import argparse
@@ -44,14 +45,12 @@ def main():
   parser.add_argument('--allow_tf32', action='store_true')
   args = parser.parse_args()
 
-  torch.backends.cuda.matmul.allow_tf32 = args.allow_tf32
-  torch.backends.cudnn.allow_tf32 = args.allow_tf32
-
   config = load_config(args.config)
   if args.batch_size is not None:
     config.training.batch_size = config.training.small_batch_size = args.batch_size
   if args.fd_step is not None:
     config.training.fd_step = args.fd_step
+  config.training.fd_allow_tf32 = args.allow_tf32
   device = config.device
   sde = methods.Homotopy(config)
   torch.manual_seed(0)
@@ -70,14 +69,18 @@ def main():
       loss.backward()
     return float(loss)
 
+  default_tf32 = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
   grads, values = {}, {}
   for mode in ('double', 'first_order'):
+    torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False  # strict fp32 reference
     values[mode] = step(mode, seed=1234)
     grads[mode] = torch.cat([p.grad.flatten() for p in params if p.grad is not None])
+  torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = default_tf32
   ref, new = grads['double'], grads['first_order']
   cos = torch.nn.functional.cosine_similarity(new, ref, dim=0).item()
   rel = ((new - ref).norm() / ref.norm()).item()
-  print(f"fd_step={config.training.fd_step:g}  TF32={args.allow_tf32}")
+  print(f"fd_step={config.training.fd_step:g}  fd_allow_tf32={args.allow_tf32}  "
+        f"default TF32 flags (matmul, cudnn) used for 'double' timing: {default_tf32}")
   print(f"loss: double={values['double']:.6f}  first_order={values['first_order']:.6f}")
   print(f"parameter gradient: cosine={cos:.6f}  relative L2 error={rel:.2e}")
 

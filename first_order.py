@@ -21,8 +21,8 @@ Requirements / caveats:
   * Dropout masks must be identical in all three passes (handled here by replaying the RNG state).
   * The network must be per-sample independent (no BatchNorm in train mode), since each sample gets
     its own finite-difference direction.
-  * The finite difference needs full fp32: disable TF32 (torch.backends.cudnn.allow_tf32 = False,
-    torch.backends.cuda.matmul.allow_tf32 = False) and do not autocast these passes to fp16/bf16.
+  * The finite difference needs full fp32: TF32 is disabled inside these passes unless allow_tf32=True,
+    and they must not be autocast to fp16/bf16.
     Run check_first_order.py to confirm agreement with double backprop on your hardware/precision.
 """
 
@@ -41,7 +41,29 @@ def _set_rng_state(state):
     torch.cuda.set_rng_state_all(cuda)
 
 
-def first_order_backward(net_fn, x, cond, extra, zeroth_weights, grad_loss_fn, fd_step=3e-2):
+class _StrictFP32:
+  """Disables TF32 inside the block (the finite difference cancels ~h of Phi's leading digits)."""
+
+  def __init__(self, enabled):
+    self.enabled = enabled
+
+  def __enter__(self):
+    self.saved = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
+    if self.enabled:
+      torch.backends.cuda.matmul.allow_tf32 = False
+      torch.backends.cudnn.allow_tf32 = False
+
+  def __exit__(self, *exc):
+    torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = self.saved
+
+
+def first_order_backward(net_fn, x, cond, extra, zeroth_weights, grad_loss_fn, fd_step=3e-2,
+                         allow_tf32=False):
+  with _StrictFP32(not allow_tf32):
+    return _first_order_backward(net_fn, x, cond, extra, zeroth_weights, grad_loss_fn, fd_step)
+
+
+def _first_order_backward(net_fn, x, cond, extra, zeroth_weights, grad_loss_fn, fd_step):
   """Accumulates grad_theta of  sum_i zeroth_weights_i * Phi_i + grad_loss_fn(g_x, g_t)  into `.grad`.
 
   Args:
@@ -54,6 +76,8 @@ def first_order_backward(net_fn, x, cond, extra, zeroth_weights, grad_loss_fn, f
     grad_loss_fn: callable (g_x, g_t) -> scalar loss built from the gradients (g_t is None if cond is None).
       It is evaluated on detached leaves, so it must be differentiable w.r.t. its inputs only.
     fd_step: finite-difference step along the unit direction in (x, t) space.
+    allow_tf32: keep TF32 convolutions/matmuls on (faster on Ampere+, but the finite difference then
+      needs a larger fd_step and has ~% level error; check with check_first_order.py --allow_tf32).
 
   Returns:
     psi (detached [B]), g_x (detached), g_t (detached or None), grad_loss (detached scalar).

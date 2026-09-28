@@ -24,6 +24,7 @@ def get_default_configs():
   ## first-order passes only (see first_order.py). fd_step: finite-difference step of 'first_order'.
   training.grad_mode = 'double'
   training.fd_step = 3e-2
+  training.fd_allow_tf32 = False
 
   # sampling
   config.sampling = sampling = ml_collections.ConfigDict()
