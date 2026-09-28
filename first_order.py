@@ -15,7 +15,8 @@ parameter gradient using only ordinary first-order backward passes:
     grad_theta sum_i a_i Phi(x_i) with detached weights a_i; it is carried by the same two passes via
     (Phi(z + h u) + Phi(z - h u)) / 2 = Phi(z) + O(h^2).  The first pass only computes grad_(x,t) Phi.
   * The whole surrogate is a weighted sum of per-sample Phi evaluations, so the three forward passes
-    are back-propagated one at a time: peak activation memory equals ordinary first-order training.
+    are back-propagated one at a time and no backward graph is ever kept: peak memory is about half that
+    of the create_graph path (and ~1.35x a plain first-order step), for ~1.33x its FLOPs.
 
 Requirements / caveats:
   * Dropout masks must be identical in all three passes (handled here by replaying the RNG state).

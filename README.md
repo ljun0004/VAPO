@@ -58,7 +58,7 @@ python3 main.py --config ./configs/homotopy/cifar10.py --mode train --workdir ho
 
 ### Training without double backpropagation
 
-The gradient-norm, cosine and time-derivative terms of the VAPO loss depend on `∇Φ`, so by default (`training.grad_mode='double'`) training back-propagates through `torch.autograd.grad(..., create_graph=True)`. Setting `--config.training.grad_mode=first_order` computes the same parameter gradient (up to an `O(fd_step²)` finite-difference error) with first-order backward passes only, at the peak activation memory of ordinary first-order training (see `first_order.py`). These passes run in strict fp32 (TF32 off) unless `training.fd_allow_tf32=True`. To compare both modes on your GPU (gradient agreement, peak memory, time per step):
+The gradient-norm, cosine and time-derivative terms of the VAPO loss depend on `∇Φ`, so by default (`training.grad_mode='double'`) training back-propagates through `torch.autograd.grad(..., create_graph=True)`. Setting `--config.training.grad_mode=first_order` computes the same parameter gradient (up to an `O(fd_step²)` finite-difference error) with first-order backward passes only (see `first_order.py`): about half the peak memory for about 1.33x the FLOPs. These passes run in strict fp32 (TF32 off) unless `training.fd_allow_tf32=True`. To compare both modes on your GPU (gradient agreement, peak memory, time per step):
 
 ```sh
 python3 check_first_order.py --config ./configs/homotopy/cifar10.py --batch_size 128
